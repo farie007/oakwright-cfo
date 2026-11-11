@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server'
 
 /**
- * Accepts the contact form payload and forwards it to n8n.
- * n8n webhook JSON (capitalized keys for easy mapping):
- * { Name, Email, Phone, Industry, Revenue, Message?, source, submittedAt }
- *
- * After n8n cleans the lead, pipe it into GoHighLevel.
+ * Accepts the contact form payload and emails it via Resend.
+ * Payload: { Name, Email, Phone, Industry, Revenue, Message?, source, submittedAt }
  */
+const esc = (v: unknown) =>
+  String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!))
+
 export async function POST(request: Request) {
   let body: unknown
 
@@ -29,32 +29,57 @@ export async function POST(request: Request) {
     }
   }
 
-  const webhookUrl = process.env.N8N_WEBHOOK_URL || process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL
+  const apiKey = process.env.RESEND_API_KEY
+  const to = (process.env.CONTACT_EMAIL || '').split(',').map((s) => s.trim()).filter(Boolean)
 
-  if (!webhookUrl) {
-    console.info('[leads] N8N_WEBHOOK_URL not set. Payload ready for n8n:', lead)
-    return NextResponse.json({ ok: true, forwarded: false }, { status: 200 })
+  if (!apiKey || to.length === 0) {
+    console.error('[leads] RESEND_API_KEY or CONTACT_EMAIL not set. Lead NOT delivered:', lead)
+    return NextResponse.json({ ok: false, error: 'Email not configured' }, { status: 500 })
   }
 
+  const fields: [string, unknown][] = [
+    ['Name', lead.Name],
+    ['Email', lead.Email],
+    ['Phone', lead.Phone],
+    ['Industry', lead.Industry],
+    ['Revenue', lead.Revenue],
+    ['Message', lead.Message],
+    ['Source', lead.source],
+    ['Submitted', lead.submittedAt],
+  ]
+  const filled = fields.filter(([, v]) => String(v ?? '').trim() !== '')
+  const rows = filled
+    .map(
+      ([k, v]) =>
+        `<tr><td style="padding:6px 16px 6px 0;font-weight:bold;vertical-align:top;color:#333">${k}</td>` +
+        `<td style="padding:6px 0;color:#333">${esc(v).replace(/\n/g, '<br>')}</td></tr>`
+    )
+    .join('')
+  const text = filled.map(([k, v]) => `${k}: ${v}`).join('\n')
+
   try {
-    const upstream = await fetch(webhookUrl, {
+    const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(lead),
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: process.env.CONTACT_FROM_EMAIL || 'Oakwright CFO Website <website@oakwrightcfo.com>',
+        to,
+        reply_to: String(lead.Email).trim(),
+        subject: `New website inquiry: ${String(lead.Name).trim()} (${String(lead.Industry).trim()})`,
+        html: `<p style="font-family:Arial,sans-serif;font-size:14px">New inquiry from <b>oakwrightcfo.com</b>. Reply to this email to respond directly.</p><table style="font-family:Arial,sans-serif;font-size:14px">${rows}</table>`,
+        text: `New inquiry from oakwrightcfo.com\n\n${text}`,
+      }),
     })
 
-    if (!upstream.ok) {
-      const detail = await upstream.text().catch(() => '')
-      console.error('[leads] n8n webhook failed', upstream.status, detail)
-      return NextResponse.json({ ok: false, error: 'Upstream webhook failed' }, { status: 502 })
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      console.error('[leads] Resend failed', res.status, detail, lead)
+      return NextResponse.json({ ok: false, error: 'Email send failed' }, { status: 502 })
     }
 
-    return NextResponse.json({ ok: true, forwarded: true }, { status: 200 })
+    return NextResponse.json({ ok: true, sent: true }, { status: 200 })
   } catch (error) {
-    console.error('[leads] n8n webhook error', error)
-    return NextResponse.json({ ok: false, error: 'Upstream webhook unreachable' }, { status: 502 })
+    console.error('[leads] Resend error', error, lead)
+    return NextResponse.json({ ok: false, error: 'Email service unreachable' }, { status: 502 })
   }
 }
